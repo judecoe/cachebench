@@ -9,8 +9,10 @@ Python 3.12, FastAPI, Redis, FAISS (IndexIDMap(IndexFlatIP)), sentence-transform
 
 ## Commands
 
-- Test: pytest -q
-- Run: docker compose up
+- Install: uv sync
+- Test: uv run pytest -q
+- Lint: uv run ruff check . && uv run ruff format --check .
+- Run: docker compose up (gateway :8000 with fake backend, Redis)
   (update as scripts are added)
 
 ## Rules

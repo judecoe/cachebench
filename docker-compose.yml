@@ -1,0 +1,35 @@
+services:
+  gateway:
+    build: .
+    ports: ["8000:8000"]
+    environment:
+      CACHEBENCH_REDIS_URL: redis://redis:6379/0
+      CACHEBENCH_BACKEND: ${CACHEBENCH_BACKEND:-fake}   # compose up works with no model running
+      CACHEBENCH_LOCAL_BASE_URL: ${CACHEBENCH_LOCAL_BASE_URL:-http://host.docker.internal:11434/v1}
+      HF_HUB_OFFLINE: "1"
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    # Must stay at one worker: the semantic index and coalescing map are in process memory.
+    command: ["uvicorn", "cachebench.api.app:create_app", "--factory",
+              "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+    depends_on:
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+    cpus: "4"          # fixed for reproducible benchmarks
+    mem_limit: 2g
+
+  redis:
+    image: redis:7.4-alpine   # TODO: pin @sha256 digest
+    # Persistence off and memory bounded (design doc, "Open before winter break" item 2).
+    command: ["redis-server", "--save", "", "--appendonly", "no",
+              "--maxmemory", "512mb", "--maxmemory-policy", "allkeys-lru"]
+    ports: ["127.0.0.1:6379:6379"]   # for host-run integration tests
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
