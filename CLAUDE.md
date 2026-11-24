@@ -13,6 +13,8 @@ Python 3.12, FastAPI, Redis, FAISS (IndexIDMap(IndexFlatIP)), sentence-transform
 - Test: uv run pytest -q
 - Lint: uv run ruff check . && uv run ruff format --check .
 - Run: docker compose up (gateway :8000 with fake backend, Redis)
+- Embedding latency (Docker only): scripts/measure_embed_latency.sh → results/embed_latency/
+- Score text pairs: uv run python scripts/score_pairs.py pairs.jsonl [--threshold T]
   (update as scripts are added)
 
 ## Rules

@@ -13,3 +13,13 @@ uv run pytest -q        # tests
 docker compose up       # gateway on :8000 (fake backend) + Redis
 curl localhost:8000/healthz
 ```
+
+## Scripts
+
+```sh
+scripts/measure_embed_latency.sh                        # embedding p50/p95 in Docker; JSON to results/embed_latency/
+uv run python scripts/score_pairs.py pairs.jsonl        # cosine similarity per pair, grouped by category
+```
+
+`pairs.jsonl` has one object per line: `{"a": "...", "b": "...", "category": "..."}`, with
+optional `id` and `note`.
