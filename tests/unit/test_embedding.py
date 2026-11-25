@@ -1,4 +1,7 @@
-"""Embedder: bge-small at the pinned revision. Loads the real model (CPU), hence `slow`."""
+"""Embedder: bge-small at the pinned revision. Loads the real model (CPU), hence `slow`.
+
+Every embedder test runs against both runtimes.
+"""
 
 from concurrent.futures import ThreadPoolExecutor
 
@@ -6,7 +9,7 @@ import numpy as np
 import pytest
 
 from cachebench.embedding import Embedder, TextTooLongError
-from cachebench.model_pin import EMBEDDING_DIM, MAX_SEQ_TOKENS
+from cachebench.model_pin import EMBEDDING_DIM, EMBEDDING_RUNTIME, MAX_SEQ_TOKENS
 
 pytestmark = pytest.mark.slow
 
@@ -19,14 +22,28 @@ TEXTS = [
 ]
 
 
-@pytest.fixture(scope="module")
-def embedder() -> Embedder:
-    return Embedder()
+@pytest.fixture(scope="module", params=["torch", "onnx"])
+def embedder(request: pytest.FixtureRequest) -> Embedder:
+    return Embedder(runtime=request.param)
 
 
 def test_limits_match_design() -> None:
     assert EMBEDDING_DIM == 384
     assert MAX_SEQ_TOKENS == 512
+    assert EMBEDDING_RUNTIME in ("torch", "onnx")
+
+
+def test_default_runtime_is_the_pinned_one() -> None:
+    # The gateway and the tuning tool both construct Embedder() with no arguments.
+    assert Embedder().runtime == EMBEDDING_RUNTIME
+
+
+def test_onnx_matches_torch() -> None:
+    texts = [*TEXTS, "def f():\n    return 1", "hello " * (MAX_SEQ_TOKENS - 2)]
+    torch_vecs = Embedder(runtime="torch").embed_batch(texts)
+    onnx_vecs = Embedder(runtime="onnx").embed_batch(texts)
+    cosines = np.sum(torch_vecs * onnx_vecs, axis=1)
+    assert cosines.min() > 0.9999
 
 
 def test_embedding_is_384_dim_float32(embedder: Embedder) -> None:
@@ -47,7 +64,8 @@ def test_embedding_is_deterministic(embedder: Embedder) -> None:
 
 
 def test_embedding_is_deterministic_across_instances(embedder: Embedder) -> None:
-    assert np.array_equal(Embedder().embed_batch(TEXTS), embedder.embed_batch(TEXTS))
+    fresh = Embedder(runtime=embedder.runtime)
+    assert np.array_equal(fresh.embed_batch(TEXTS), embedder.embed_batch(TEXTS))
 
 
 def test_batch_matches_single(embedder: Embedder) -> None:

@@ -3,11 +3,19 @@
 Run through scripts/measure_embed_latency.sh, which builds the image, starts this script in
 the gateway container (same CPU and memory limits as the gateway), and passes host info in.
 
-For each (torch threads, concurrency) pair, this embeds 1,000 unique short queries one per
-call, the way the gateway will: an asyncio event loop hands each call to a thread pool
-(`concurrency` workers, `concurrency` calls in flight). Latency is measured per call from
-submit to result, so at concurrency > 1 it includes time queued behind other calls.
-A warmup of separate queries runs in the same pool first.
+For each (threads, concurrency, think time) combination, this embeds 1,000 unique short
+queries one per call, the way the gateway will: an asyncio event loop hands each call to a
+thread pool (`concurrency` workers and clients). Latency is measured per call from submit
+to result, so at concurrency > 1 it includes time queued behind other calls. A warmup of
+separate queries runs in the same pool first.
+
+Think time is how long each client waits after a call before sending the next. 0 ms gives
+capacity (every client re-sends at once). 1,000 ms stands in for the FakeBackend's fixed
+delay in the overhead benchmark (design.md, "Decisions made"), so it shows embed latency
+at the load the miss path will actually see. Think time > 0 applies only at concurrency > 1.
+
+--runtime picks torch or onnx (default: the pinned EMBEDDING_RUNTIME). Threads are torch
+intra-op threads or the onnx session's intra-op threads.
 
 Queries are generated from templates with a fixed seed. Raw latencies, hardware, and
 library versions go to results/embed_latency/<UTC timestamp>.json.
@@ -31,7 +39,7 @@ import numpy as np
 import torch
 
 from cachebench.embedding import Embedder
-from cachebench.model_pin import MODEL_NAME, MODEL_REVISION
+from cachebench.model_pin import EMBEDDING_RUNTIME, MODEL_NAME, MODEL_REVISION
 
 # Miss-path overhead budget (docs/design.md, "Non-functional"). Embedding is one component
 # of the miss path, so it has to fit well inside this with room for search and Redis.
@@ -80,9 +88,13 @@ def make_queries(n: int, seed: int) -> list[str]:
 
 
 async def run_calls(
-    embedder: Embedder, pool: ThreadPoolExecutor, queries: list[str], concurrency: int
+    embedder: Embedder,
+    pool: ThreadPoolExecutor,
+    queries: list[str],
+    concurrency: int,
+    think_ms: float,
 ) -> tuple[list[float], float]:
-    """Embed every query with `concurrency` calls in flight. Returns (latencies_ms, wall_s)."""
+    """Embed every query from `concurrency` clients. Returns (latencies_ms, wall_s)."""
     loop = asyncio.get_running_loop()
     latencies = [0.0] * len(queries)
     pending = iter(enumerate(queries))
@@ -92,6 +104,8 @@ async def run_calls(
             t0 = time.perf_counter_ns()
             await loop.run_in_executor(pool, embedder.embed, q)
             latencies[i] = (time.perf_counter_ns() - t0) / 1e6
+            if think_ms:
+                await asyncio.sleep(think_ms / 1000)
 
     start = time.perf_counter()
     await asyncio.gather(*(client() for _ in range(concurrency)))
@@ -114,23 +128,27 @@ def summarize(latencies: list[float], wall_s: float) -> dict[str, float]:
 
 async def measure(
     embedder: Embedder,
-    threads: int,
     concurrency: int,
+    think_ms: float,
     warmup: list[str],
     queries: list[str],
 ) -> dict:
+    threads = embedder.threads
     torch.set_num_threads(threads)
     with ThreadPoolExecutor(
         max_workers=concurrency, initializer=torch.set_num_threads, initargs=(threads,)
     ) as pool:
         loop = asyncio.get_running_loop()
         observed = await loop.run_in_executor(pool, torch.get_num_threads)
-        await run_calls(embedder, pool, warmup, concurrency)
-        latencies, wall_s = await run_calls(embedder, pool, queries, concurrency)
+        await run_calls(embedder, pool, warmup, concurrency, think_ms)
+        latencies, wall_s = await run_calls(embedder, pool, queries, concurrency, think_ms)
     return {
-        "torch_threads": threads,
+        "runtime": embedder.runtime,
+        "threads": threads,
         "torch_threads_observed_in_worker": observed,
         "concurrency": concurrency,
+        "think_ms": think_ms,
+        "kind": "capacity" if think_ms == 0 and concurrency > 1 else "latency",
         "pool_workers": concurrency,
         **summarize(latencies, wall_s),
         "latencies_ms": [round(x, 4) for x in latencies],
@@ -154,7 +172,14 @@ def hardware_info() -> dict:
             in {"model name", "CPU implementer", "CPU part", "Features", "BogoMIPS"}
         }
     )
-    pkgs = ["torch", "sentence-transformers", "transformers", "tokenizers", "numpy"]
+    pkgs = [
+        "torch",
+        "onnxruntime",
+        "sentence-transformers",
+        "transformers",
+        "tokenizers",
+        "numpy",
+    ]
     return {
         "container": {
             "platform": platform.platform(),
@@ -190,6 +215,8 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=100)
     parser.add_argument("--threads", type=int, nargs="+", default=[1, 4])
     parser.add_argument("--concurrency", type=int, nargs="+", default=[1, 16])
+    parser.add_argument("--think-ms", type=float, nargs="+", default=[0, 1000])
+    parser.add_argument("--runtime", choices=["torch", "onnx"], default=EMBEDDING_RUNTIME)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out-dir", default="results/embed_latency")
     args = parser.parse_args()
@@ -200,26 +227,34 @@ def main() -> None:
     all_queries = make_queries(args.n + args.warmup, args.seed)
     warmup, queries = all_queries[: args.warmup], all_queries[args.warmup :]
 
-    embedder = Embedder()
-    token_counts = [embedder.token_count(q) for q in queries]
-
     runs = []
     for threads in args.threads:
+        embedder = Embedder(runtime=args.runtime, threads=threads)
+        token_counts = [embedder.token_count(q) for q in queries]
         for concurrency in args.concurrency:
-            run = asyncio.run(measure(embedder, threads, concurrency, warmup, queries))
-            runs.append(run)
-            print(
-                f"threads={threads:<2} concurrency={concurrency:<3} "
-                f"p50={run['p50_ms']:7.2f} ms  p95={run['p95_ms']:7.2f} ms  "
-                f"p99={run['p99_ms']:7.2f} ms  {run['throughput_qps']:7.1f} q/s",
-                flush=True,
-            )
+            for think_ms in args.think_ms:
+                if think_ms and concurrency == 1:
+                    continue
+                run = asyncio.run(measure(embedder, concurrency, think_ms, warmup, queries))
+                runs.append(run)
+                print(
+                    f"{args.runtime:<5} threads={threads:<2} concurrency={concurrency:<3} "
+                    f"think={think_ms:>5.0f} ms  "
+                    f"p50={run['p50_ms']:7.2f} ms  p95={run['p95_ms']:7.2f} ms  "
+                    f"p99={run['p99_ms']:7.2f} ms  {run['throughput_qps']:7.1f} q/s",
+                    flush=True,
+                )
 
     timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     result = {
         "benchmark": "embed_latency",
         "timestamp_utc": timestamp,
-        "model": {"name": MODEL_NAME, "revision": MODEL_REVISION, "device": "cpu"},
+        "model": {
+            "name": MODEL_NAME,
+            "revision": MODEL_REVISION,
+            "runtime": args.runtime,
+            "device": "cpu",
+        },
         "workload": {
             "seed": args.seed,
             "n": args.n,
@@ -235,7 +270,8 @@ def main() -> None:
         "method": (
             "one embed() call per query (normalize, token-length check, encode, L2 normalize); "
             "asyncio loop -> ThreadPoolExecutor(pool_workers); latency from submit to result, "
-            "including queueing; percentiles by numpy linear interpolation"
+            "including queueing; each client waits think_ms after each call (0 = capacity; "
+            "1000 = FakeBackend delay); percentiles by numpy linear interpolation"
         ),
         "reference_budget_miss_overhead": BUDGET,
         "hardware": hardware_info(),
@@ -243,7 +279,7 @@ def main() -> None:
     }
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{timestamp}.json"
+    out_path = out_dir / f"{timestamp}_{args.runtime}.json"
     out_path.write_text(json.dumps(result, indent=2) + "\n")
     print(f"wrote {out_path}")
 

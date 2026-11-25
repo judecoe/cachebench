@@ -131,7 +131,7 @@ It is demonstrated on Quora Question Pairs (QQP), a public dataset of question p
 | p50 and p95 latency: exact hit, semantic hit, miss, direct backend, gateway overhead alone | Where time goes |
 | Throughput and overhead at concurrency 1, 4, 16, 32, and 64 | Cost of the gateway itself |
 
-Overhead benchmarks use the `FakeBackend`, so model latency variance doesn't swamp the overhead budget.
+Overhead benchmarks use the `FakeBackend` at a fixed 1,000 ms delay, so model latency variance doesn't swamp the overhead budget. Throughput with zero backend delay is reported separately as capacity.
 
 **Baselines:** no cache, and exact-match cache only.
 
@@ -168,6 +168,7 @@ Public GitHub repo with Docker Compose setup; the tuning tool; benchmark scripts
 - Embedding model: `BAAI/bge-small-en-v1.5`, pinned revision. A second model is added only if it would change the threshold recommendation.
 - Correctness target: 95% Wilson upper bound on held-out false-hit rate of at most 2%; zero adversarial hits.
 - Overhead budget: miss overhead at most 10 ms p50 and 25 ms p95 at concurrency 16.
+- Overhead measurement backend: `FakeBackend` with a fixed 1,000 ms delay, typical latency for short completions; chosen before any miss-path benchmark. Throughput with zero backend delay is reported separately as capacity, not as overhead.
 - Index: one `IndexIDMap(IndexFlatIP)` per namespace with normalized vectors; global LRU with 100K-entry capacity; no HNSW.
 - Deletion: tombstones filtered at search time; batched `remove_ids` through the single writer when dead entries exceed 10%.
 - Coalescing on exact keys only in v1.
@@ -206,7 +207,7 @@ Each item has a proposed default. Unless changed, the default is adopted when wi
 10. **Threshold sweep rules.** The Wilson upper bound is wide when there are few hits and doesn't fall steadily as the threshold changes. The 400-hit minimum is decided (see "Decisions made"). Proposed: grid step 0.005; "loosest" means the lowest threshold at which it and every stricter qualifying threshold meet the target. If the held-out check fails, the miss is reported and the tool does not re-tune on held-out data.
 11. **Adversarial gate versus tuning.** Proposed: the shipped threshold is the stricter of the QQP threshold and the loosest threshold that blocks every adversarial pair; both are reported. An adversarial "hit" means the pair's similarity reaches the threshold (stricter than testing through the gateway). The write-up notes that the adversarial set then helps set the threshold as well as check it.
 12. **Question 4 criterion and workload parameters.** Proposed: semantic caching is worth its overhead if it adds at least 5 percentage points of hit rate over exact-only at medium repetition at the shipped threshold, reported next to the incorrect-served rate. Zipf exponents, number of intents, stream length, and paraphrase fraction are fixed before any workload is generated.
-13. **Overhead measurement.** Proposed: the primary number is per-request gateway handler time minus backend call time; the end-to-end difference against direct backend calls is a cross-check. "Miss" means a full embed-and-search miss on all-unique queries, not a bypass. The load generator runs inside the Compose network, and the gateway container has a fixed CPU limit on documented hardware.
+13. **Overhead measurement.** Proposed: the primary number is per-request gateway handler time minus backend call time; the end-to-end difference against direct backend calls is a cross-check. "Miss" means a full embed-and-search miss on all-unique queries, not a bypass. The `FakeBackend` delay is decided: a fixed 1,000 ms (see "Decisions made"), with zero-delay throughput reported separately as capacity. The load generator runs inside the Compose network, and the gateway container has a fixed CPU limit on documented hardware.
 14. **QQP license and published results.** QQP is covered by Quora's terms, not an open license. Proposed: commit QQP IDs and a download script, never question text (including workloads and the hand-checked sample).
 15. **Training overlap.** BGE's English training mix is reported to include Quora duplicates. Proposed: confirm in November; if confirmed, report QQP results as optimistic and give the hand-checked sample and adversarial set more weight.
 16. **Cached response format.** Proposed: a cached response gets a new `id` and `created` and keeps its original `usage`; the gateway adds `X-Cache` and `X-Cache-Similarity` headers and logs `tokens_saved`.
